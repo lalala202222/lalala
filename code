@@ -1,0 +1,96 @@
+import warnings
+import os
+from datasets import Dataset
+from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer, Trainer, TrainingArguments, AutoTokenizer, AutoModelForSeq2SeqLM
+from huggingface_hub import login
+
+# 使用令牌登录 Hugging Face Hub
+# 这里的登录部分可以省略，因为你不需要推送到 Hugging Face Hub
+# login("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")
+
+warnings.filterwarnings("ignore")
+
+# 设置镜像站点 URL
+#os.environ["HUGGINGFACE_HUB_BASE_URL"] = "https://hf-mirror.com"
+
+# 检查点恢复函数
+def get_latest_checkpoint(output_dir):
+    checkpoints = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if not checkpoints:
+        return None
+    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+    return os.path.join(output_dir, checkpoints[-1])
+
+# 设置本地缓存路径
+model_cache_dir = "D:/Study/Modeal/nllb-200-distilled-600M"  # 本地模型路径
+dataset_cache_dir = "D:/Study/Dataset/Helsinki-NLPnews_commentary"  # 本地数据集路径
+
+# 加载模型
+print("正在加载模型...")
+tokenizer = AutoTokenizer.from_pretrained(model_cache_dir)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_cache_dir)
+print("模型加载完成。")
+
+# 加载数据集
+print("正在加载数据集...")
+# 使用 load_dataset 加载本地 .parquet 文件
+dataset = Dataset.from_parquet(os.path.join(dataset_cache_dir, "de-zh.parquet"))
+print("数据集加载完成。")
+
+# 数据预处理函数
+def preprocess_function(examples):
+    src_texts = [ex["de"] for ex in examples["translation"]]
+    tgt_texts = [ex["zh"] for ex in examples["translation"]]
+    model_inputs = tokenizer(src_texts, truncation=True, padding="max_length", max_length=128)
+    labels = tokenizer(tgt_texts, truncation=True, padding="max_length", max_length=128)
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+# 数据集预处理
+print("正在预处理数据...")
+train_dataset = dataset.map(preprocess_function, batched=True)
+train_dataset, eval_dataset = train_dataset.train_test_split(test_size=0.1, seed=42).values()
+print("数据预处理完成。")
+
+# 确保输出目录存在
+os.makedirs("./results", exist_ok=True)
+
+# 设置训练参数
+training_args = TrainingArguments(
+    output_dir="./results",
+    save_steps=500,
+    eval_steps=500,
+    evaluation_strategy="steps",
+    save_strategy="steps",
+    learning_rate=2e-5,
+    per_device_train_batch_size=8,
+    num_train_epochs=3,
+    # 不需要推送到 Hugging Face Hub
+    push_to_hub=False,
+    logging_dir="./logs",  # 设置日志输出目录
+    device="cuda",  # 使用 GPU 进行训练
+    fp16=True,  # 开启混合精度训练（如果你使用的 GPU 支持）
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    tokenizer=tokenizer,
+)
+
+# 恢复训练
+latest_checkpoint = get_latest_checkpoint(training_args.output_dir)
+if latest_checkpoint:
+    print(f"恢复训练：加载最新检查点 {latest_checkpoint}")
+    trainer.train(resume_from_checkpoint=latest_checkpoint)
+else:
+    print("未找到检查点，从头开始训练")
+    trainer.train()
+
+# 训练结束后保存模型到本地
+print("训练完成，保存模型到本地...")
+model.save_pretrained("./local_model")  # 保存模型
+tokenizer.save_pretrained("./local_model")  # 保存分词器
+print("模型已保存到本地。")
